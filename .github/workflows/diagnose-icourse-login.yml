@@ -27,7 +27,7 @@ jobs:
           python -u - <<'PY'
           import contextlib
           import io
-          from urllib.parse import parse_qs, urlsplit
+          from urllib.parse import parse_qs, urljoin, urlsplit
           from src.api.webvpn import WebVPNSession
 
           def route(url):
@@ -89,11 +89,40 @@ jobs:
                         isinstance(body.get("data"), dict) and bool(body["data"].get("loginToken")),
                         file=report)
 
+          class BrowserEntrySession(WebVPNSession):
+              def _get_auth_context(self):
+                  entry = "https://webvpn.fudan.edu.cn/login?cas_login=true"
+                  response = self.session.get(entry, allow_redirects=False, timeout=25)
+                  for _ in range(8):
+                      target = urljoin(response.url, response.headers.get("Location", ""))
+                      parsed = urlsplit(target)
+                      if parsed.scheme != "https" or parsed.hostname not in {
+                          "webvpn.fudan.edu.cn", "id.fudan.edu.cn"
+                      }:
+                          raise RuntimeError()
+                      context = parse_qs(parsed.query).get("lck", [])
+                      if context and parsed.hostname == "id.fudan.edu.cn":
+                          print("Official entry delivered UIS context", file=report)
+                          return context[0], "https://webvpn.fudan.edu.cn"
+                      if not response.is_redirect:
+                          break
+                      response = self.session.get(target, allow_redirects=False, timeout=25)
+                  raise RuntimeError()
+
+              def _establish_session(self, ticket_url):
+                  host = urlsplit(ticket_url)
+                  if host.scheme != "https" or host.hostname != "webvpn.fudan.edu.cn":
+                      raise RuntimeError()
+                  super()._establish_session(ticket_url)
+                  print("WebVPN cookie in jar:", any(
+                      c.name == "wengine_vpn_ticket" for c in self.session.cookies
+                  ), file=report)
+
           import sys
           report = sys.stdout
-          for attempt in range(1, 3):
+          for attempt in range(1, 4):
               print("Attempt", attempt)
-              vpn = WebVPNSession()
+              vpn = BrowserEntrySession()
               vpn.session.hooks["response"].append(inspect)
               stage = "WebVPN"
               try:
