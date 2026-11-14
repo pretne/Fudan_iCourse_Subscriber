@@ -100,7 +100,8 @@ jobs:
                           "webvpn.fudan.edu.cn", "id.fudan.edu.cn"
                       }:
                           raise RuntimeError()
-                      context = parse_qs(parsed.query).get("lck", [])
+                      fragment_query = parsed.fragment.partition("?")[2]
+                      context = parse_qs(parsed.query or fragment_query).get("lck", [])
                       if context and parsed.hostname == "id.fudan.edu.cn":
                           print("Official entry delivered UIS context", file=report)
                           return context[0], "https://webvpn.fudan.edu.cn"
