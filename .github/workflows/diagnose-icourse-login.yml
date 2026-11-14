@@ -1,0 +1,103 @@
+name: Diagnose iCourse login
+on:
+  push:
+    branches: [codex/diagnose-icourse-login-20261114]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python -m pip install requests pycryptodome
+      - name: Probe WebVPN and iCourse authentication
+        env:
+          StuId: ${{ secrets.STUID }}
+          UISPsw: ${{ secrets.UISPSW }}
+        run: |
+          python -u - <<'PY'
+          import contextlib
+          import io
+          from urllib.parse import urlsplit
+          from src.api.webvpn import WebVPNSession
+
+          def route(url):
+              path = urlsplit(url).path.rstrip("/")
+              for known in (
+                  "/idp/authn/authExecute", "/idp/authCenter/authnEngine",
+                  "/casapi/index.php", "/userapi/v1/infosimple",
+                  "/login", "/portal", "/ac",
+              ):
+                  if path == known or path.endswith(known):
+                      return known
+              return "root" if not path else "other"
+
+          def inspect(response, *args, **kwargs):
+              url = urlsplit(response.url)
+              if url.hostname not in {"webvpn.fudan.edu.cn", "id.fudan.edu.cn", "icourse.fudan.edu.cn"}:
+                  return
+              kind = route(response.url)
+              if kind not in {"root", "/login", "/portal", "/idp/authn/authExecute", "/userapi/v1/infosimple"}:
+                  return
+              dest = response.headers.get("Location", "")
+              print("HTTP", url.hostname, kind, response.status_code,
+                    "redirect route:", route(dest) if dest else "none", file=report)
+              if kind != "/idp/authn/authExecute":
+                  return
+              try:
+                  body = response.json()
+              except ValueError:
+                  print("Auth response is not JSON", file=report)
+                  return
+              allowed = {"code", "data", "message", "msg", "loginToken", "requestType",
+                         "nextAuth", "nextAuthModule", "authModuleCode", "authChainCode",
+                         "verifyCode", "captcha", "mfa", "result", "status", "success",
+                         "needCaptcha", "needMfa", "needVerify", "authResult"}
+              def schema(obj):
+                  if not isinstance(obj, dict):
+                      return type(obj).__name__
+                  return sorted(set(obj) & allowed), len(set(obj) - allowed)
+              if isinstance(body, dict):
+                  print("Auth response fields (known, other count):", schema(body),
+                        "data fields:", schema(body.get("data")),
+                        "business code is 200:", str(body.get("code")) == "200",
+                        "top-level login token present:", bool(body.get("loginToken")),
+                        "nested login token present:",
+                        isinstance(body.get("data"), dict) and bool(body["data"].get("loginToken")),
+                        file=report)
+
+          import sys
+          report = sys.stdout
+          for attempt in range(1, 4):
+              print("Attempt", attempt)
+              vpn = WebVPNSession()
+              vpn.session.hooks["response"].append(inspect)
+              stage = "WebVPN"
+              try:
+                  with contextlib.redirect_stdout(io.StringIO()):
+                      vpn.login()
+                      stage = "iCourse CAS"
+                      vpn.authenticate_icourse()
+                      stage = "iCourse API verification"
+                      resp = vpn.get("https://icourse.fudan.edu.cn/userapi/v1/infosimple", timeout=20)
+                      if resp.status_code != 200 or resp.json().get("code") not in (0, 200):
+                          raise RuntimeError()
+              except Exception as exc:
+                  print("Failed stage:", stage, "exception:", type(exc).__name__)
+              else:
+                  print("iCourse session verified")
+                  break
+              finally:
+                  vpn.session.close()
+          else:
+              raise SystemExit(1)
+          PY
